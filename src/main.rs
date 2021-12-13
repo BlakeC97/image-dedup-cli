@@ -1,20 +1,32 @@
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
+use argh::FromArgs;
 use glob::glob;
 use image::imageops::FilterType;
 use img_hash::{HashAlg, HasherConfig};
+use rayon::prelude::*;
 
 const VALID_EXTENSIONS: [&str; 4] = ["png", "jpeg", "jpg", "gif"];
 
+#[derive(FromArgs, Debug)]
+/// Command-line arguments for image deduplication.
+struct Args {
+    /// one or more directories to check for duplicates in, each directory is checked independently
+    #[argh(positional)]
+    directories: Vec<String>,
+}
+
 #[derive(Debug)]
+/// Various properties to describe an image.
 struct ImageProperties {
     path: PathBuf,
     file_size: u64,
 }
 
-fn find_duplicates(directory: &str) {
+fn find_duplicates(directory: &str) -> Result<(), io::Error> {
     let owned_dir = directory.to_owned();
 
     let images: Vec<PathBuf> = glob(&(owned_dir.clone() + r"/*.*"))
@@ -28,8 +40,17 @@ fn find_duplicates(directory: &str) {
         .hash_alg(HashAlg::Gradient)
         .resize_filter(FilterType::Triangle)
         .to_hasher();
+
     for image in &images {
-        let image_obj = image::open(image).unwrap();
+        let image_obj = match image::open(image) {
+            Ok(img) => img,
+            Err(e) => {
+                return Err(io::Error::new(
+                    ErrorKind::Other,
+                    format!("Error opening `{:?}`, original error: {}", image, e),
+                ))
+            }
+        };
         let hash = hasher.hash_image(&image_obj);
         let mut hash_num: u64 = 0;
         for (idx, byte) in hash.as_bytes().iter().enumerate() {
@@ -39,19 +60,13 @@ fn find_duplicates(directory: &str) {
         // Get the vector (or make a new one if not added) and add a new ImageProperties to it
         let img_prop = ImageProperties {
             path: image.clone(),
-            file_size: fs::metadata(image).unwrap().len(),
+            file_size: fs::metadata(image)?.len(),
         };
 
         // Gets an Entry from the hash map, which is an enum that can be: OccupiedEntry, VacantEntry.
         // Adds a new vector if it's a VacantEntry.
         // https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html#method.or_default
         hashes.entry(hash_num).or_default().push(img_prop);
-    }
-
-    for (hash, entries) in &hashes {
-        if entries.len() > 1 {
-            println!("{}: {:?}", hash, entries);
-        }
     }
 
     let duplicate_path = owned_dir + "/duplicates";
@@ -76,18 +91,33 @@ fn find_duplicates(directory: &str) {
         });
 
     // If we didn't find any duplicates, don't leave the empty directory behind
-    if fs::read_dir(&duplicate_path).unwrap().count() == 0 {
-        println!("No duplicates found in {:?}", duplicate_path);
+    if fs::read_dir(&duplicate_path)?.count() == 0 {
         match fs::remove_dir(&duplicate_path) {
-            Ok(_) => {}
+            Ok(_) => println!(
+                "No duplicates found in {:?}",
+                duplicate_path.parent().unwrap_or_else(|| Path::new(""))
+            ),
             Err(e) => eprintln!(
                 "Failed removing duplicate_path: {:?}\nReason: {}",
                 &duplicate_path, e
             ),
         }
     }
+
+    // Clippy complains if I use an explicit return, but I hate implicit returns >:(
+    Ok(())
 }
 
 fn main() {
-    find_duplicates(r"C:\Users\Chris\Pictures\Sample");
+    let args: Args = argh::from_env();
+
+    if args.directories.is_empty() {
+        eprintln!("Missing argument: directory. Try '--help' for more info.")
+    } else {
+        args.directories
+            .par_iter()
+            .map(|dir| find_duplicates(dir))
+            .filter_map(|res| res.err())
+            .for_each(|err| eprintln!("{:?}", err));
+    }
 }
