@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -29,10 +30,20 @@ struct ImageProperties {
 fn find_duplicates(directory: &str) -> Result<(), io::Error> {
     let owned_dir = directory.to_owned();
 
-    let images: Vec<PathBuf> = glob(&(owned_dir.clone() + r"/*.*"))
-        .unwrap()
+    let dup_glob = match glob(&(owned_dir.clone() + r"/*.*")) {
+        Ok(g) => g,
+        Err(e) => return Err(io::Error::new(ErrorKind::Other, e.msg)),
+    };
+    let images: Vec<PathBuf> = dup_glob
         .filter_map(Result::ok)
-        .filter(|pb| VALID_EXTENSIONS.contains(&pb.extension().unwrap().to_str().unwrap()))
+        .filter(|pb| {
+            VALID_EXTENSIONS.contains(
+                &pb.extension()
+                    .unwrap_or(&OsString::new())
+                    .to_str()
+                    .unwrap_or(""),
+            )
+        })
         .collect();
 
     let mut hashes: HashMap<u64, Vec<ImageProperties>> = HashMap::new();
@@ -45,10 +56,8 @@ fn find_duplicates(directory: &str) -> Result<(), io::Error> {
         let image_obj = match image::open(image) {
             Ok(img) => img,
             Err(e) => {
-                return Err(io::Error::new(
-                    ErrorKind::Other,
-                    format!("Error opening `{:?}`, original error: {}", image, e),
-                ))
+                eprintln!("Skipping opening {:?}, original error: {}", image, e);
+                continue;
             }
         };
         let hash = hasher.hash_image(&image_obj);
@@ -60,7 +69,10 @@ fn find_duplicates(directory: &str) -> Result<(), io::Error> {
         // Get the vector (or make a new one if not added) and add a new ImageProperties to it
         let img_prop = ImageProperties {
             path: image.clone(),
-            file_size: fs::metadata(image)?.len(),
+            file_size: match fs::metadata(image) {
+                Ok(md) => md.len(),
+                Err(_) => 0,
+            },
         };
 
         // Gets an Entry from the hash map, which is an enum that can be: OccupiedEntry, VacantEntry.
@@ -72,35 +84,37 @@ fn find_duplicates(directory: &str) -> Result<(), io::Error> {
     let duplicate_path = owned_dir + "/duplicates";
     // `duplicate_path` *will* be modified within the for_each loops below, beware!
     let mut duplicate_path = PathBuf::from(&duplicate_path);
-    fs::create_dir_all(&duplicate_path).unwrap();
+    fs::create_dir_all(&duplicate_path)?;
     hashes
         .values()
         .filter(|entries| entries.len() > 1)
         .for_each(|entries| {
             entries.iter().for_each(|e| {
                 // Modify `duplicate_path` to move the file into the `duplicates` directory
-                let name = &e.path.file_name().unwrap();
-
-                duplicate_path.push(name);
-                match fs::rename(&e.path, &duplicate_path) {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Failed moving file: {:?}\nReason: {}", name, e),
-                };
-                duplicate_path.pop();
+                if let Some(name) = &e.path.file_name() {
+                    duplicate_path.push(name);
+                    match fs::rename(&e.path, &duplicate_path) {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Failed moving file: {:?}\nReason: {}", name, e),
+                    };
+                    duplicate_path.pop();
+                }
             })
         });
 
     // If we didn't find any duplicates, don't leave the empty directory behind
-    if fs::read_dir(&duplicate_path)?.count() == 0 {
-        match fs::remove_dir(&duplicate_path) {
-            Ok(_) => println!(
-                "No duplicates found in {:?}",
-                duplicate_path.parent().unwrap_or_else(|| Path::new(""))
-            ),
-            Err(e) => eprintln!(
-                "Failed removing duplicate_path: {:?}\nReason: {}",
-                &duplicate_path, e
-            ),
+    if let Ok(d) = fs::read_dir(&duplicate_path) {
+        if d.count() == 0 {
+            match fs::remove_dir(&duplicate_path) {
+                Ok(_) => println!(
+                    "No duplicates found in {:?}",
+                    duplicate_path.parent().unwrap_or_else(|| Path::new(""))
+                ),
+                Err(e) => eprintln!(
+                    "Failed removing duplicate_path: {:?}\nReason: {}",
+                    &duplicate_path, e
+                ),
+            }
         }
     }
 
@@ -117,7 +131,7 @@ fn main() {
         args.directories
             .par_iter()
             .map(|dir| find_duplicates(dir))
-            .filter_map(|res| res.err())
+            .filter_map(Result::err)
             .for_each(|err| eprintln!("{:?}", err));
     }
 }
